@@ -5,9 +5,13 @@ Lua values, entities, vectors, angles, matrices and colors into compact strings 
 them back. It continues [Srlion's Fast Serializer](https://github.com/Srlion/sfs) (SFS) and
 keeps its API.
 
-The encoder writes into a reused buffer of strings and concatenates it once. It reports
-failures by returning values instead of raising errors or concatenating strings, so the JIT
-compiler compiles every step of an encode. Failures come back as `nil` and an error message.
+The encoder writes into a reused buffer of strings and concatenates it once, and the decoder
+reads a table and every table inside it in a single loop. Both are written for the JIT
+compilers of the three LuaJIT versions a server and its clients run (the server's 2.1, the
+2.1.0-beta3 of 64-bit clients and the 2.0.4 of 32-bit clients): they tell values apart without
+calling the engine's `type` and `isstring`, Lua functions at which LuaJIT ends the trace of the
+caller, and they never concatenate strings, create closures or call `math.frexp` and
+`math.ldexp` on the way of a value. Failures come back as `nil` and an error message.
 
 NFS is written with the LuaJIT syntax extensions of the Flux runtime (`+=`, `!=`, `a ? b : c`,
 `const`), which the server's `lua_shared` compiles and lowers to plain Lua for clients. It does
@@ -54,7 +58,9 @@ local value, decode_err = NFS.decode(data)
 
 `NFS.decode(data, max_size)` stops with `bytes overflow` once it would read past `max_size`
 bytes. Data from clients is hostile: pass a `max_size` you are willing to process, and treat
-an error return as a rejected message.
+an error return as a rejected message. `NFS.decode` never raises an error for the bytes it is
+given: malformed data, data that is nested however deeply and errors raised by the decoders of
+custom types all come back as `nil` and an error message.
 
 `NFS.encode_to_hex(value)` and `NFS.decode_from_hex(str)` do the same with two hexadecimal
 digits per byte, for places that only take printable text.
@@ -64,18 +70,22 @@ digits per byte, for places that only take printable text.
 | Value | Encoded as |
 |---|---|
 | `nil`, `true`, `false` | the type id alone |
-| integers | the type id alone from -54 to 100, else 1, 2, 4 or 7 bytes of magnitude; -0 keeps its sign |
+| integers | the type id alone from -54 to 100, else 1, 2, 4 or 7 bytes of magnitude below 2^56; -0 keeps its sign |
 | other numbers | an IEEE 754 double, NaN and the infinities included |
 | strings | the type id alone holds lengths up to 55, else a 1, 2 or 4 byte length, then the bytes |
 | tables | an array while the keys run 1, 2, 3 and so on, a hash, or an array followed by a hash |
 | `Entity`, `Weapon`, `Vehicle`, `NPC`, `NextBot` | the entity index in 2 bytes; NULL is kept apart from the world |
-| `Player` | the entity index in 1 byte |
+| `Player` | the entity index in 1 byte; a player that has left comes back as NULL |
 | `Vector`, `Angle` | three single-precision floats |
 | `VMatrix` | sixteen single-precision floats |
-| `Color` | four bytes |
+| `Color` | four bytes; channels are floored and kept within 0 and 255 |
 
 Functions, and any other value without an encoder, fail with `unsupported type: <type>`.
 Tables are encoded by their contents, so a table that contains itself overflows the stack.
+
+The engine has the processor treat subnormal numbers (below 2^-1022) as zero, so in the game
+such a number is encoded as the zero it compares equal to. Outside of the game it round-trips
+exactly, like every other double.
 
 ### Custom types
 
@@ -103,7 +113,18 @@ end)
 
 Ids are handed out in the order the types are added, so both realms have to add the same
 types in the same order. `NFS.set_custom_type_with_id(type_id, type_key, encoder, decoder)`
-takes the id from the caller instead.
+takes the id from the caller instead. It may take the id of a built-in type together with the
+type itself, such as `NFS.TYPES.vector.start` for a `Vector` encoding of your own, but not the
+ids of small integers, short strings, tables and `ending`, which the decoder reads in place:
+those raise an error.
+
+A custom type may also replace a built-in one by its type name (`'number'`, `'string'`,
+`'table'`, `'Vector'` and so on). `NFS.encode` writes nil, booleans, numbers, strings and
+tables without looking at `NFS.Encoder.encoders`, and finds engine values by their metatable;
+adding the custom type switches that off for the type it replaces, while assigning into
+`encoders` by hand does not.
+
+A decoder that raises an error fails the decode with that error as the message.
 
 An encoder returns `true` to fail, after writing the error message as the last two pieces of the
 buffer with `NFS.Encoder.write_str`. A decoder returns the value, or `nil` and an error message.
@@ -117,8 +138,16 @@ name. `NFS.Decoder` holds the matching `read_*` functions, `peak_type`, `setup_c
 `decoders` table by type id. `NFS.new_buffer`, `NFS.end_buffer` and `NFS.reset_buffer` make,
 finish and empty a buffer of your own. `NFS.TYPES` lists the type id ranges by name.
 
-`NFS.set_type_function(fn)` replaces the function the encoder names a value's type with, for
-a type function that the JIT compiler compiles where the engine's own does not.
+`NFS.Encoder.encode` and `NFS.Decoder.decode` do not go through these functions themselves:
+they pass the length of the buffer and the read position along as arguments, and fill index 0
+of the buffer and the context only around the encoders and decoders of engine and custom
+types. `NFS.encode` is reentrant, so an encoder may call it for a value of its own, and so is
+`NFS.decode`.
+
+`NFS.set_type_function(fn)` replaces the function the encoder names a value's type with. The
+encoder only asks it about values that are not nil, a boolean, a number or a string and whose
+metatable has no encoder. Until it is replaced the encoder does not call it for tables either:
+it knows a table by `rawget` accepting it.
 
 ## Wire format
 
@@ -126,6 +155,26 @@ Every value starts with a one-byte type id. The ids are assigned in the order th
 declares its types, so the format is only stable within one version of NFS. Client and server
 run the same copy, which keeps them in sync, but encoded data should not be stored for a later
 version to read. Multi-byte integers and floats are big-endian.
+
+| Ids | Type | Follows the id |
+|---|---|---|
+| 0 to 100 | `positive_fixed` | nothing: the id is the integer |
+| 101 to 156 | `string_fixed` | the bytes of a string of 0 to 55 bytes |
+| 157 to 211 | `negative_fixed` | nothing: the integer is 157 minus the id, and 157 is -0 |
+| 212, 213, 214 | `array`, `table`, `array_and_table` | values, pairs, or values, `ending` and pairs; then `ending` |
+| 215 | `ending` | nothing |
+| 216, 217, 218 | `nil`, `false`, `true` | nothing |
+| 219 to 222 | `positive_u8` to `positive_u53` | the integer in 1, 2, 4 or 7 bytes |
+| 223 to 226 | `negative_u8` to `negative_u53` | the magnitude in 1, 2, 4 or 7 bytes |
+| 227, 228, 229 | `string_u8`, `string_u16`, `string_u32` | the length in 1, 2 or 4 bytes, then the bytes |
+| 230, 231 | `float`, `double` | 4 or 8 bytes of IEEE 754 |
+| 232, 233 | `entity`, `player` | the index in 2 bytes, two's complement, or in 1 byte |
+| 234, 235 | `vector`, `angle` | three floats |
+| 236, 237 | `matrix`, `color` | sixteen floats; four bytes |
+| 238 to 255 | `custom` | whatever the encoder of the custom type writes |
+
+The decoder tells the ranges up to `ending` apart by comparing ids, which is why they come
+first. `NFS.TYPES` holds the same ranges by name at run time.
 
 ## Development
 
