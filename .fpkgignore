@@ -1,0 +1,6 @@
+# The package holds the spec, the readme, the license and the library only.
+/*
+!/packagespec.lua
+!/README.md
+!/LICENSE
+!/lib/

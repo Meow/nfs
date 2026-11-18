@@ -1,0 +1,20 @@
+Style/IncompleteDocumentation:
+  Enabled: true
+
+Lint/UncheckedEntityInCallback:
+  EntityNames: ['actor', 'ply', 'client', 'ent', 'target']
+
+Style/BitOperators:
+  Enabled: true
+
+Style/CompoundAssignment:
+  Enabled: true
+
+Style/NumericSeparators:
+  Enabled: true
+
+Style/ShortFunction:
+  Enabled: true
+
+Style/TernaryOperator:
+  Enabled: true
