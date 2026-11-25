@@ -152,9 +152,10 @@ it knows a table by `rawget` accepting it.
 ## Wire format
 
 Every value starts with a one-byte type id. The ids are assigned in the order the library
-declares its types, so the format is only stable within one version of NFS. Client and server
-run the same copy, which keeps them in sync, but encoded data should not be stored for a later
-version to read. Multi-byte integers and floats are big-endian.
+declares its types. The format changes only with the major version: every minor and patch
+release encodes exactly as its major's first release (8.x.x as 8.0.0), so a server whose
+`lua_shared` has NFS 8.0.0 built in can keep it for any 8.x.x package. Encoded data should not
+be stored for another major version to read. Multi-byte integers and floats are big-endian.
 
 | Ids | Type | Follows the id |
 |---|---|---|
